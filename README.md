@@ -17,4 +17,5 @@
 
 모든 저작권과 사용 권한은 별화묘원 운영 측 및 각 원저작자에게 있습니다.
 
-Copyright (c) Byulhmoyowon. All rights reserved.
+Copyright (c) 별화묘원. All rights reserved.
+
