@@ -1,2 +1,2 @@
 # ResourcePack-Public
-Byulhmoyowon resource pack distribution
+Auto ResourcePack Upload
