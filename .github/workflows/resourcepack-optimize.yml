@@ -1,0 +1,447 @@
+name: 리소스팩 최적화
+# 공개 저장소(kooyhee/ResourcePack-Public)에서 실행됨
+# 실행 로그와 아티팩트가 누구에게나 공개되므로
+# 원본 팩/설정 내용이나 비공개 파일 목록을 로그로 출력하지 않음
+# packsquash.toml, automation/ci/* 스크립트는 런타임에 비공개 저장소에서 가져옴
+run-name: "리소스팩 최적화 (${{ github.event_name == 'workflow_dispatch' && inputs.source_tag || 'source-latest' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 원본 ZIP이 업로드된 릴리스 태그
+        default: source-latest
+        type: string
+      source_asset:
+        description: 원본 ZIP 파일명 패턴
+        default: generated.zip
+        type: string
+      publish:
+        description: 공개 저장소 배포 여부
+        default: true
+        type: boolean
+      force:
+        description: SHA256 캐시 무시하고 강제 최적화
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [source-pack-updated]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: resourcepack-optimize
+  cancel-in-progress: true
+
+env:
+  PACKSQUASH_VERSION: '0.4.1'
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # repository_dispatch는 이미 쓰기 권한 토큰이 필요하므로 통과
+      - name: repository_dispatch 통과
+        if: github.event_name == 'repository_dispatch'
+        run: echo "repository_dispatch는 쓰기 권한 토큰이 필요하므로 별도 검증 없이 통과"
+        shell: bash
+      - name: 실행 권한 검증
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 협력자 권한 조회 실패(권한 없음/404)도 거부로 처리
+          PERM=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq '.permission' 2>/dev/null || echo "none")
+          case "$PERM" in
+            admin|maintain|write)
+              echo "권한 확인 성공"
+              ;;
+            *)
+              echo "::error::실행 권한이 없습니다. admin/maintain/write만 가능합니다."
+              exit 1
+              ;;
+          esac
+        shell: bash
+
+  optimize:
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # 최적화 잡은 읽기 권한만 필요하다. 릴리스 쓰기는 publish 잡에서만 수행한다.
+    permissions:
+      contents: read
+    outputs:
+      should_publish: ${{ steps.should_publish.outputs.value }}
+      pack_sha256: ${{ steps.verify.outputs.pack_sha256 }}
+      pack_bytes: ${{ steps.verify.outputs.pack_bytes }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 비공개 설정 저장소 체크아웃
+      - name: 비공개 저장소 체크아웃
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          SOURCE_REPO: ${{ vars.SOURCE_REPO || 'kooyhee/ResourcePack' }}
+        run: |
+          if [ -z "$PRIVATE_TOKEN" ]; then
+            echo "::error::PRIVATE_REPO_TOKEN 시크릿이 설정되지 않았습니다. 비공개 저장소에서 설정/스크립트를 가져올 수 없습니다."
+            exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${PRIVATE_TOKEN}@github.com/${SOURCE_REPO}.git" private
+        shell: bash
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 트리거 유형에 따라 입력값 통일
+      - name: 입력값 해석
+        id: inputs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CLIENT_TAG: ${{ github.event.client_payload.source_tag || 'source-latest' }}
+          CLIENT_ASSET: ${{ github.event.client_payload.source_asset || 'generated.zip' }}
+          CLIENT_PUBLISH: ${{ github.event.client_payload.publish || 'true' }}
+          CLIENT_FORCE: ${{ github.event.client_payload.force || 'false' }}
+          INPUT_TAG: ${{ inputs.source_tag }}
+          INPUT_ASSET: ${{ inputs.source_asset }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            echo "source_tag=$CLIENT_TAG" >> "$GITHUB_OUTPUT"
+            echo "source_asset=$CLIENT_ASSET" >> "$GITHUB_OUTPUT"
+            echo "publish=$CLIENT_PUBLISH" >> "$GITHUB_OUTPUT"
+            echo "force=$CLIENT_FORCE" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "source_tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            echo "source_asset=$INPUT_ASSET" >> "$GITHUB_OUTPUT"
+            echo "publish=$INPUT_PUBLISH" >> "$GITHUB_OUTPUT"
+            echo "force=$INPUT_FORCE" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_tag=source-latest" >> "$GITHUB_OUTPUT"
+            echo "source_asset=generated.zip" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "force=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Discord 시작 알림
+        continue-on-error: true
+        run: python private/automation/ci/notify_discord.py --status start --title "리소스팩 최적화 시작"
+        shell: bash
+
+      - name: 작업 폴더 준비
+        run: rm -rf work dist build && mkdir -p work dist build
+        shell: bash
+
+      # 비공개 저장소에서 원본 ZIP 다운로드
+      - name: 원본 ZIP 다운로드
+        id: download
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          SOURCE_REPO: ${{ vars.SOURCE_REPO || 'kooyhee/ResourcePack' }}
+          TAG: ${{ steps.inputs.outputs.source_tag }}
+          ASSET: ${{ steps.inputs.outputs.source_asset }}
+        run: |
+          echo "::notice::원본 ZIP 다운로드"
+          if ! gh release download "$TAG" --pattern "$ASSET" --dir "work/" --repo "$SOURCE_REPO"; then
+            echo "::error::원본 ZIP 다운로드 실패"
+            exit 1
+          fi
+        shell: bash
+
+      - name: 원본 SHA256 계산
+        id: source_hash
+        env:
+          SOURCE_ASSET: ${{ steps.inputs.outputs.source_asset }}
+        run: |
+          SHA=$(sha256sum "work/$SOURCE_ASSET" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "원본 SHA256: $SHA"
+        shell: bash
+
+      - name: SHA256 캐시 확인
+        id: cache
+        if: steps.inputs.outputs.force != 'true'
+        uses: actions/cache@v4
+        with:
+          path: build/source-hash
+          key: source-hash-${{ steps.source_hash.outputs.sha256 }}
+
+      # ---- 캐시 miss일 때만 실행 ----
+
+      # 비공개 자산 경로 확인
+      - name: 비공개 자산 확인
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          if [ ! -f private/packsquash.toml ]; then
+            echo "::error::private/packsquash.toml을 찾을 수 없습니다. 비공개 저장소 체크아웃을 확인하세요."
+            exit 1
+          fi
+          if [ ! -f private/automation/ci/prepare_pack.py ]; then
+            echo "::error::private/automation/ci/prepare_pack.py를 찾을 수 없습니다."
+            exit 1
+          fi
+          echo "비공개 자산 확인 완료"
+        shell: bash
+
+      - name: ZIP 추출 및 검증 (prepare_pack)
+        id: prepare
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          SOURCE_ASSET: ${{ steps.inputs.outputs.source_asset }}
+        run: python private/automation/ci/prepare_pack.py --zip "work/$SOURCE_ASSET" --dest work/source-pack --github-output "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: PackSquash 옵션 생성 (render_options)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python private/automation/ci/render_options.py --base private/packsquash.toml --pack-directory work/source-pack --output-file dist/pack.zip --out build/packsquash.generated.toml
+        shell: bash
+
+      - name: PackSquash 1차 최적화
+        id: packsquash
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: ComunidadAylas/PackSquash-action@v4
+        with:
+          packsquash_version: ${{ env.PACKSQUASH_VERSION }}
+          options: build/packsquash.generated.toml
+          artifact_name: optimized-pack
+
+      - name: PNG 정규화 및 재시도 준비
+        if: steps.cache.outputs.cache-hit != 'true' && steps.packsquash.outcome == 'failure'
+        run: |
+          pip install --quiet pillow
+          python private/automation/ci/normalize_png.py --root work/source-pack
+          python private/automation/ci/render_options.py --base private/packsquash.toml --pack-directory work/source-pack --output-file dist/pack.zip --out build/packsquash.generated.toml
+
+      - name: PackSquash 2차 최적화
+        if: steps.cache.outputs.cache-hit != 'true' && steps.packsquash.outcome == 'failure'
+        uses: ComunidadAylas/PackSquash-action@v4
+        with:
+          packsquash_version: ${{ env.PACKSQUASH_VERSION }}
+          options: build/packsquash.generated.toml
+          artifact_name: optimized-pack-retry
+          action_cache_revision: retry-${{ github.run_id }}
+
+      # ---- 산출물 검증 및 메타데이터 ----
+
+      - name: 산출물 검증
+        id: verify
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          if [ ! -f dist/pack.zip ]; then
+            echo "::error::dist/pack.zip 파일이 존재하지 않습니다."
+            exit 1
+          fi
+          if [ ! -s dist/pack.zip ]; then
+            echo "::error::dist/pack.zip 파일 크기가 0바이트입니다."
+            exit 1
+          fi
+          unzip -tq dist/pack.zip || { echo "::error::ZIP 무결성 검증 실패"; exit 1; }
+          unzip -l dist/pack.zip | grep -q "pack.mcmeta" || { echo "::error::ZIP에 pack.mcmeta가 포함되지 않음"; exit 1; }
+          SHA=$(sha256sum dist/pack.zip | cut -d' ' -f1)
+          BYTES=$(stat -c%s dist/pack.zip)
+          echo "pack_sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "pack_bytes=$BYTES" >> "$GITHUB_OUTPUT"
+          echo "인증 성공"
+        shell: bash
+
+      - name: 메타데이터 생성
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          SOURCE_TAG: ${{ steps.inputs.outputs.source_tag }}
+          PACK_SHA256: ${{ steps.verify.outputs.pack_sha256 }}
+          SOURCE_SHA256: ${{ steps.source_hash.outputs.sha256 }}
+          PACK_BYTES: ${{ steps.verify.outputs.pack_bytes }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          echo "$PACK_SHA256  dist/pack.zip" > dist/pack.zip.sha256
+          GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          jq -n \
+            --arg source_tag "$SOURCE_TAG" \
+            --arg commit "$COMMIT_SHA" \
+            --argjson run_number "$RUN_NUMBER" \
+            --arg source_sha256 "$SOURCE_SHA256" \
+            --arg run_url "$RUN_URL" \
+            --arg generated_at "$GENERATED_AT" \
+            --argjson byte_size "$PACK_BYTES" \
+            '{source_tag: $source_tag, commit: $commit, run_number: $run_number, source_sha256: $source_sha256, run_url: $run_url, generated_at: $generated_at, byte_size: $byte_size}' \
+            > dist/version.json
+        shell: bash
+
+      - name: 캐시 히트 기록
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          SOURCE_HASH: ${{ steps.source_hash.outputs.sha256 }}
+        run: echo "$SOURCE_HASH" > build/source-hash
+        shell: bash
+
+      - name: 산출물 업로드
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: resourcepack-dist
+          path: |
+            dist/pack.zip
+            dist/pack.zip.sha256
+            dist/version.json
+          retention-days: 7
+
+      # ---- 결과 요약 ----
+      - name: 결과 요약
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        env:
+          SOURCE_TAG: ${{ steps.inputs.outputs.source_tag }}
+          PACK_SHA256: ${{ steps.verify.outputs.pack_sha256 }}
+          PACK_BYTES: ${{ steps.verify.outputs.pack_bytes }}
+          SOURCE_BYTES: ${{ steps.prepare.outputs.total_bytes }}
+          REPAIRS: ${{ steps.prepare.outputs.repairs }}
+        run: |
+          if [ -n "$SOURCE_BYTES" ] && [ "$SOURCE_BYTES" -gt 0 ] 2>/dev/null && [ -n "$PACK_BYTES" ] && [ "$PACK_BYTES" -gt 0 ] 2>/dev/null; then
+            SAVING="$(( (SOURCE_BYTES - PACK_BYTES) * 100 / SOURCE_BYTES ))%"
+          else
+            SAVING="-"
+          fi
+          echo "## 리소스팩 최적화 결과" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 항목 | 값 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SHA256 | \`${PACK_SHA256:--}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 원본 크기 | ${SOURCE_BYTES:--} 바이트 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 산출물 크기 | ${PACK_BYTES:--} 바이트 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 절감률 | $SAVING |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 수리 항목 | ${REPAIRS:--} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 소스 태그 | $SOURCE_TAG |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 실행 링크 | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |" >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: 배포 여부 결정
+        id: should_publish
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          PUBLISH: ${{ steps.inputs.outputs.publish }}
+        run: |
+          if [ "$CACHE_HIT" = "true" ]; then
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$PUBLISH" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Discord 완료 알림
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          PACK_SHA256: ${{ steps.verify.outputs.pack_sha256 }}
+          PACK_BYTES: ${{ steps.verify.outputs.pack_bytes }}
+        run: |
+          if [[ "$VERIFY_OUTCOME" == "success" ]]; then
+            STATUS="success"
+            TITLE="리소스팩 최적화 성공"
+          else
+            STATUS="failure"
+            TITLE="리소스팩 최적화 실패"
+          fi
+          python private/automation/ci/notify_discord.py \
+            --status "$STATUS" \
+            --title "$TITLE" \
+            --field "SHA256=${PACK_SHA256:--}" \
+            --field "크기=${PACK_BYTES:--} 바이트" \
+            --url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # 비공개 저장소 체크아웃 정리
+      # git clone URL에 토큰이 포함되므로 러너 정리 전에 원격 설정과 파일을 함께 제거한다
+      - name: 비공개 자산 정리
+        if: always()
+        run: rm -rf private
+        shell: bash
+
+  # ──────────────────────────────────────────────
+  # publish: 같은 공개 저장소 릴리스 업로드
+  # ──────────────────────────────────────────────
+  publish:
+    needs: [guard, optimize]
+    if: needs.optimize.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    # 릴리스 자산 업로드를 위해 이 잡에서만 쓰기 권한을 사용한다
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: 산출물 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: resourcepack-dist
+          path: dist/
+
+      - name: 공개 저장소 릴리스 업데이트
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ vars.PUBLIC_RELEASE_TAG || 'latest-resource-pack' }}
+        run: |
+          echo "릴리스 태그: $TAG"
+          if ! gh release view "$TAG" &>/dev/null; then
+            echo "릴리스 '$TAG'가 없어 새로 생성합니다."
+            gh release create "$TAG" \
+              --title "리소스팩 $TAG" \
+              --notes "자동 생성된 리소스팩 릴리스"
+          fi
+          gh release upload "$TAG" --clobber \
+            dist/pack.zip \
+            dist/pack.zip.sha256 \
+            dist/version.json
+          echo "업로드 완료"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # 공개 URL 200 + Content-Length 일치 여부를 최대 180초 폴링
+      - name: 공개 URL 검증
+        env:
+          EXPECTED: ${{ needs.optimize.outputs.pack_bytes }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          URL="${SERVER_URL}/${REPO}/releases/download/${TAG}/pack.zip"
+          SHA256=$(awk '{print $1}' dist/pack.zip.sha256)
+          echo "검증 URL: $URL"
+          for i in $(seq 1 36); do
+            # 헤더만 받아 최종 응답의 상태 코드와 content-length를 한 번에 확인한다
+            # (본문을 내려받지 않으므로 폴링 비용이 파일 크기와 무관하다)
+            HEADERS=$(curl -sIL --max-time 30 -w '\nHTTP_CODE:%{http_code}\n' "$URL" || true)
+            HTTP_CODE=$(printf '%s\n' "$HEADERS" | grep '^HTTP_CODE:' | tail -1 | cut -d: -f2)
+            SIZE=$(printf '%s\n' "$HEADERS" | tr -d '\r' \
+              | grep -i '^content-length:' | tail -1 | awk '{print $2}')
+            if [ "$HTTP_CODE" = "200" ] && [ "$SIZE" = "$EXPECTED" ]; then
+              echo "::notice::공개 URL 검증 성공 (HTTP $HTTP_CODE, $SIZE 바이트)"
+              break
+            fi
+            if [ "$i" -eq 36 ]; then
+              echo "::error::공개 URL 검증 실패 (180초 초과): HTTP=${HTTP_CODE:--}, Size=${SIZE:--}, 기대=$EXPECTED"
+              exit 1
+            fi
+            echo "대기 중... ($i/36)"
+            sleep 5
+          done
+          echo "## 공개 배포 결과" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **공개 URL**: $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **SHA256**: \`$SHA256\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **파일 크기**: $EXPECTED 바이트" >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
