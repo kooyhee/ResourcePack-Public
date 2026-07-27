@@ -173,7 +173,7 @@ jobs:
       - name: SHA256 캐시 확인
         id: cache
         if: steps.inputs.outputs.force != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/source-hash
           key: source-hash-${{ steps.source_hash.outputs.sha256 }}
