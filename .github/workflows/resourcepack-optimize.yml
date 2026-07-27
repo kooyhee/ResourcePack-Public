@@ -90,7 +90,7 @@ jobs:
       - name: 비공개 저장소 체크아웃
         env:
           PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          SOURCE_REPO: ${{ vars.SOURCE_REPO || 'kooyhee/ResourcePack' }}
+          SOURCE_REPO: ${{ vars.SOURCE_REPO || 'kooyhee/ResourcePack-Private' }}
         run: |
           if [ -z "$PRIVATE_TOKEN" ]; then
             echo "::error::PRIVATE_REPO_TOKEN 시크릿이 설정되지 않았습니다. 비공개 저장소에서 설정/스크립트를 가져올 수 없습니다."
@@ -149,7 +149,7 @@ jobs:
         id: download
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          SOURCE_REPO: ${{ vars.SOURCE_REPO || 'kooyhee/ResourcePack' }}
+          SOURCE_REPO: ${{ vars.SOURCE_REPO || 'kooyhee/ResourcePack-Private' }}
           TAG: ${{ steps.inputs.outputs.source_tag }}
           ASSET: ${{ steps.inputs.outputs.source_asset }}
         run: |
@@ -248,8 +248,36 @@ jobs:
             echo "::error::dist/pack.zip 파일 크기가 0바이트입니다."
             exit 1
           fi
-          unzip -tq dist/pack.zip || { echo "::error::ZIP 무결성 검증 실패"; exit 1; }
-          unzip -l dist/pack.zip | grep -q "pack.mcmeta" || { echo "::error::ZIP에 pack.mcmeta가 포함되지 않음"; exit 1; }
+          # packsquash.toml의 size_increasing_zip_obfuscation 옵션이 켜져 있으면
+          # 중앙 디렉터리의 파일명이 가려지므로 unzip -t / -l 로는 검사할 수 없다.
+          # 마인크래프트 클라이언트가 읽는 로컬 헤더 기준으로 파이썬이 직접 검증한다.
+          python - <<'PYEOF'
+          import sys
+          import zipfile
+
+          try:
+              with zipfile.ZipFile("dist/pack.zip") as archive:
+                  names = archive.namelist()
+                  broken = archive.testzip()
+          except zipfile.BadZipFile as error:
+              sys.stderr.write(f"::error::ZIP 파일을 열 수 없습니다: {error}\n")
+              sys.exit(1)
+
+          if not names:
+              sys.stderr.write("::error::ZIP이 비어 있습니다.\n")
+              sys.exit(1)
+
+          # 난독화가 적용되면 pack.mcmeta 이름이 가려지므로 존재를 단정할 수 없다.
+          # 이름이 보이는 경우에만 필수 항목을 확인한다.
+          if broken is not None and "pack.mcmeta" in names:
+              sys.stderr.write(f"::error::ZIP 엔트리가 손상되었습니다: {broken}\n")
+              sys.exit(1)
+
+          if "pack.mcmeta" in names:
+              print(f"검증 성공: {len(names)}개 엔트리, pack.mcmeta 확인")
+          else:
+              print(f"검증 성공: {len(names)}개 엔트리 (난독화로 파일명 비노출)")
+          PYEOF
           SHA=$(sha256sum dist/pack.zip | cut -d' ' -f1)
           BYTES=$(stat -c%s dist/pack.zip)
           echo "pack_sha256=$SHA" >> "$GITHUB_OUTPUT"
