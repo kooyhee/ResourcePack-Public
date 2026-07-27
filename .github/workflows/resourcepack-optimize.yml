@@ -99,7 +99,7 @@ jobs:
           git clone --depth 1 "https://x-access-token:${PRIVATE_TOKEN}@github.com/${SOURCE_REPO}.git" private
         shell: bash
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
