@@ -1,0 +1,314 @@
+name: 서버 반영
+# 공개 저장소에서 실행됨
+# SSH 시크릿은 포크 PR에 노출되지 않음 (pull_request/pull_request_target 트리거 미사용)
+# 서버 호스트명/사용자명/포트/토큰을 로그로 출력하지 않음
+run-name: "서버 반영 (${{ github.event_name == 'workflow_dispatch' && format('수동 #{0}', github.run_number) || '최적화 후속' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pack_url:
+        description: "pack.zip 다운로드 URL (기본값: 공개 릴리스 URL 자동 구성)"
+        required: false
+        type: string
+      run_reload:
+        description: 서버 명령(iareload / iatexture all) 실행
+        required: false
+        default: true
+        type: boolean
+  workflow_run:
+    workflows: ["리소스팩 최적화"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: workflow_run 통과
+        if: github.event_name == 'workflow_run'
+        run: echo "workflow_run은 내부 트리거이므로 통과"
+        shell: bash
+      - name: 실행 권한 검증
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 협력자 조회 실패(권한 없음/404)도 거부로 처리한다
+          PERM=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq '.permission' 2>/dev/null || echo "none")
+          case "$PERM" in
+            admin|maintain|write)
+              echo "권한 확인 성공"
+              ;;
+            *)
+              echo "::error::실행 권한이 없습니다. admin/maintain/write만 가능합니다."
+              exit 1
+              ;;
+          esac
+        shell: bash
+
+  deploy:
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    steps:
+      - name: SSH 시크릿 확인
+        id: check_secrets
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          MISSING=""
+          [ -z "$SSH_HOST" ] && MISSING="$MISSING SSH_HOST"
+          [ -z "$SSH_USERNAME" ] && MISSING="$MISSING SSH_USERNAME"
+          [ -z "$SSH_PRIVATE_KEY" ] && MISSING="$MISSING SSH_PRIVATE_KEY"
+          if [ -n "$MISSING" ]; then
+            echo "::warning::필수 SSH 시크릿 미설정:$MISSING -- 서버 반영을 건너뜁니다."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: pack_url 결정
+        id: pack_url
+        if: steps.check_secrets.outputs.skip != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PACK_URL: ${{ inputs.pack_url }}
+          TAG: ${{ vars.PUBLIC_RELEASE_TAG || 'latest-resource-pack' }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] && [[ -n "$INPUT_PACK_URL" ]]; then
+            URL="$INPUT_PACK_URL"
+          else
+            URL="${SERVER_URL}/${REPO}/releases/download/${TAG}/pack.zip"
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # SSH 터널을 열고 패널 API 또는 RCON으로 후속 명령을 전송한다.
+      # 로그에는 성공/실패 여부만 남기고 호스트/사용자/토큰/응답 본문은 출력하지 않는다.
+      - name: SSH 터널 및 서버 명령 전송
+        if: steps.check_secrets.outputs.skip != 'true'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+          RCON_PASSWORD: ${{ secrets.RCON_PASSWORD }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_RELOAD_INPUT: ${{ inputs.run_reload }}
+          COMMAND_TRANSPORT: ${{ vars.COMMAND_TRANSPORT }}
+          PANEL_DELAY: ${{ vars.PANEL_COMMAND_DELAY_SECONDS || 10 }}
+          PANEL_REMOTE_PORT: ${{ vars.PANEL_REMOTE_PORT || 8765 }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          # SSH_KNOWN_HOSTS가 있으면 호스트 키를 고정 검증한다.
+          # 없을 때만 accept-new로 대체한다 (StrictHostKeyChecking=no는 사용하지 않음).
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+            HOST_CHECK_OPTS=""
+          else
+            echo "::warning::SSH_KNOWN_HOSTS 미설정 -- accept-new로 첫 연결을 수용합니다."
+            HOST_CHECK_OPTS="-o StrictHostKeyChecking=accept-new"
+          fi
+
+          # workflow_dispatch가 아니면 항상 실행, 수동 실행이면 입력값을 그대로 따른다.
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            RUN_RELOAD="true"
+          else
+            RUN_RELOAD="$RUN_RELOAD_INPUT"
+          fi
+
+          if [ "$RUN_RELOAD" != "true" ]; then
+            echo "run_reload=false -- 서버 명령 없이 종료합니다."
+            exit 0
+          fi
+
+          # 표준 라이브러리만 사용하는 RCON 클라이언트 (mcrcon 패키지는 apt에 없음)
+          cat > /tmp/rcon_send.py <<'PYEOF'
+          """RCON 명령 전송기. 비밀번호와 응답 본문은 출력하지 않는다."""
+          import os
+          import socket
+          import struct
+          import sys
+
+
+          def recv_exact(sock: socket.socket, size: int) -> bytes:
+              buf = b""
+              while len(buf) < size:
+                  chunk = sock.recv(size - len(buf))
+                  if not chunk:
+                      raise ConnectionError("연결이 조기에 종료되었습니다.")
+                  buf += chunk
+              return buf
+
+
+          def read_packet(sock: socket.socket) -> tuple[int, int]:
+              length = struct.unpack("<i", recv_exact(sock, 4))[0]
+              if length < 10:
+                  raise ValueError("잘못된 RCON 응답 길이")
+              packet_id, packet_type = struct.unpack("<2i", recv_exact(sock, 8))
+              recv_exact(sock, length - 8)
+              return packet_id, packet_type
+
+
+          def send_packet(sock: socket.socket, packet_id: int, packet_type: int, payload: str) -> None:
+              body = struct.pack("<2i", packet_id, packet_type) + payload.encode("utf8") + b"\x00\x00"
+              sock.sendall(struct.pack("<i", len(body)) + body)
+
+
+          def main() -> None:
+              password = os.environ.get("RCON_PASSWORD", "")
+              command = os.environ.get("RCON_CMD", "")
+              port = int(os.environ.get("RCON_LOCAL_PORT", "25575"))
+
+              if not password:
+                  sys.stderr.write("오류: RCON_PASSWORD 시크릿이 필요합니다.\n")
+                  sys.exit(1)
+              if not command:
+                  sys.stderr.write("오류: 전송할 명령이 비어 있습니다.\n")
+                  sys.exit(1)
+
+              try:
+                  sock = socket.create_connection(("127.0.0.1", port), timeout=15)
+              except OSError:
+                  sys.stderr.write("오류: RCON 연결에 실패했습니다.\n")
+                  sys.exit(1)
+
+              try:
+                  send_packet(sock, 0, 3, password)
+                  packet_id, _ = read_packet(sock)
+                  if packet_id == -1:
+                      sys.stderr.write("오류: RCON 인증에 실패했습니다.\n")
+                      sys.exit(1)
+
+                  send_packet(sock, 1, 2, command)
+                  read_packet(sock)
+              except (OSError, ValueError):
+                  sys.stderr.write("오류: RCON 명령 전송에 실패했습니다.\n")
+                  sys.exit(1)
+              finally:
+                  sock.close()
+
+              print(f"명령 전송 성공: {command}")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          # 패널 세션 응답에서 토큰만 추출한다 (토큰 자체는 로그에 남기지 않음)
+          cat > /tmp/panel_token.py <<'PYEOF'
+          import json
+          import sys
+
+          try:
+              data = json.load(sys.stdin)
+          except (json.JSONDecodeError, UnicodeDecodeError):
+              sys.stderr.write("오류: 패널 세션 응답이 JSON 형식이 아닙니다.\n")
+              sys.exit(1)
+
+          token = data.get("token") if isinstance(data, dict) else None
+          if not token or not isinstance(token, str):
+              sys.stderr.write("오류: 패널 세션 응답에 token 값이 없습니다.\n")
+              sys.exit(1)
+
+          print(token)
+          PYEOF
+
+          # 로컬 포트가 실제로 열렸는지 확인한다 (ExitOnForwardFailure와 함께 이중 확인)
+          wait_for_port() {
+            local port="$1"
+            for _ in $(seq 1 12); do
+              if ss -tln 2>/dev/null | grep -q ":${port}\b"; then
+                echo "SSH 터널 확립 완료"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::error::SSH 터널을 확립하지 못했습니다."
+            return 1
+          }
+
+          if [ "$COMMAND_TRANSPORT" = "rcon" ]; then
+            echo "::group::RCON 명령 전송"
+            # 로컬 포트는 러너 전용이라 충돌 위험이 낮아 원격과 동일한 값을 사용한다
+            LOCAL_RCON=25575
+            ssh -f -N -L "${LOCAL_RCON}:127.0.0.1:25575" \
+              -p "$SSH_PORT" ${HOST_CHECK_OPTS} \
+              -o ExitOnForwardFailure=yes -o BatchMode=yes \
+              -i ~/.ssh/id_ed25519 \
+              "${SSH_USERNAME}@${SSH_HOST}"
+            wait_for_port "$LOCAL_RCON"
+
+            RCON_LOCAL_PORT="$LOCAL_RCON" RCON_CMD="iareload" python3 /tmp/rcon_send.py
+            sleep "$PANEL_DELAY"
+            RCON_LOCAL_PORT="$LOCAL_RCON" RCON_CMD="iatexture all" python3 /tmp/rcon_send.py
+            echo "::endgroup::"
+          else
+            echo "::group::패널 API 명령 전송"
+            LOCAL_PORT=8765
+            ssh -f -N -L "${LOCAL_PORT}:127.0.0.1:${PANEL_REMOTE_PORT}" \
+              -p "$SSH_PORT" ${HOST_CHECK_OPTS} \
+              -o ExitOnForwardFailure=yes -o BatchMode=yes \
+              -i ~/.ssh/id_ed25519 \
+              "${SSH_USERNAME}@${SSH_HOST}"
+            wait_for_port "$LOCAL_PORT"
+
+            if ! SESSION_RESP=$(curl -sf --max-time 15 "http://127.0.0.1:${LOCAL_PORT}/api/session"); then
+              echo "::error::패널 세션 API 호출에 실패했습니다."
+              exit 1
+            fi
+            TOKEN=$(printf '%s' "$SESSION_RESP" | python3 /tmp/panel_token.py)
+
+            send_panel_command() {
+              local command="$1"
+              local payload
+              payload=$(python3 -c 'import json,sys; print(json.dumps({"command": sys.argv[1]}))' "$command")
+              local code
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+                "http://127.0.0.1:${LOCAL_PORT}/api/command" \
+                -H "Content-Type: application/json" \
+                -H "X-Panel-Token: ${TOKEN}" \
+                -d "$payload")
+              if [ "$code" = "200" ]; then
+                echo "명령 전송 성공: ${command}"
+                return 0
+              fi
+              echo "::error::명령 전송 실패: ${command} (HTTP ${code})"
+              return 1
+            }
+
+            send_panel_command "iareload"
+            sleep "$PANEL_DELAY"
+            send_panel_command "iatexture all"
+            echo "::endgroup::"
+          fi
+
+      - name: SSH 터널 정리
+        if: always() && steps.check_secrets.outputs.skip != 'true'
+        run: |
+          rm -f ~/.ssh/id_ed25519
+          pkill -f 'ssh -f -N -L' 2>/dev/null || true
+        shell: bash
